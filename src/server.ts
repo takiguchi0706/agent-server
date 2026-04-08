@@ -36,6 +36,17 @@ const tools: Anthropic.Tool[] = [
       },
       required: ['file_path', 'content']
     }
+  },
+  {
+    name: 'list_files',
+    description: 'GitHubリポジトリの指定ディレクトリのファイル一覧を取得する',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        directory: { type: 'string', description: 'サブディレクトリ（省略時はルート）' }
+      },
+      required: []
+    }
   }
 ];
 
@@ -97,6 +108,19 @@ async function executeTool(name: string, input: Record<string, string>, departme
         return `Error: ファイルの書き込みに失敗しました (${filePath}): ${putRes.status} ${errText}`;
       }
       return `Written: ${filePath}`;
+    }
+
+    if (name === 'list_files') {
+      const dir = input.directory
+        ? `${department}/${input.directory}`
+        : department;
+      const res = await githubGet(dir);
+      if (!res.ok) {
+        return `Error: ディレクトリが見つかりません (${dir}): ${res.status} ${res.statusText}`;
+      }
+      const data = await res.json() as Array<{ name: string; type: string }>;
+      const files = data.map(f => `${f.type === 'dir' ? '[dir]' : '[file]'} ${f.name}`).join('\n');
+      return files || '(空のディレクトリ)';
     }
 
     return `Unknown tool: ${name}`;
