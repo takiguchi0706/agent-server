@@ -1,8 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import * as fs from 'fs';
-import * as path from 'path';
 
 const app = express();
 app.use(express.json());
@@ -11,32 +9,14 @@ const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-const COMPANY_ROOT = 'C:\\Users\\valuc\\projects\\company';
-
-const DEPARTMENT_PATHS: Record<string, string> = {
-  '01_secretary': '01_secretary',
-  '02_planning': '02_planning',
-  '03_design': '03_design',
-  '04_product': '04_product',
-  '05_content': '05_content',
-  '06_automation': '06_automation',
-  '07_finance': '07_finance',
-  '08_marketing': '08_marketing',
-  '09_analytics': '09_analytics',
-  '10_legal': '10_legal',
-  '11_qa': '11_qa',
-};
-
-function getDepartmentPath(department: string): string {
-  const subPath = DEPARTMENT_PATHS[department];
-  if (!subPath) throw new Error(`Unknown department: ${department}`);
-  return path.join(COMPANY_ROOT, subPath);
-}
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPO = process.env.GITHUB_REPO || 'takiguchi0706/company-context';
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
 const tools: Anthropic.Tool[] = [
   {
     name: 'read_file',
-    description: 'ファイルを読み込む',
+    description: 'GitHubリポジトリからファイルを読み込む',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -47,7 +27,7 @@ const tools: Anthropic.Tool[] = [
   },
   {
     name: 'write_file',
-    description: 'ファイルを書き込む',
+    description: 'GitHubリポジトリにファイルを書き込む（コミット）',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -59,75 +39,160 @@ const tools: Anthropic.Tool[] = [
   }
 ];
 
-function executeTool(name: string, input: Record<string, string>, department: string): string {
+async function githubGet(path: string): Promise<Response> {
+  return fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${path}?ref=${GITHUB_BRANCH}`, {
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github.v3+json',
+    },
+  });
+}
+
+async function githubPut(path: string, body: Record<string, string>): Promise<Response> {
+  return fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${path}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+async function executeTool(name: string, input: Record<string, string>, department: string): Promise<string> {
   try {
-    const basePath = getDepartmentPath(department);
+    const filePath = `${department}/${input.file_path}`;
+
     if (name === 'read_file') {
-      const fullPath = path.resolve(basePath, input.file_path);
-      return fs.readFileSync(fullPath, 'utf-8');
+      const res = await githubGet(filePath);
+      if (!res.ok) {
+        return `Error: ファイルが見つかりません (${filePath}): ${res.status} ${res.statusText}`;
+      }
+      const data = await res.json() as { content: string };
+      return Buffer.from(data.content, 'base64').toString('utf-8');
     }
+
     if (name === 'write_file') {
-      const fullPath = path.resolve(basePath, input.file_path);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, input.content, 'utf-8');
-      return `Written: ${fullPath}`;
+      // 既存ファイルのSHAを取得（存在する場合）
+      let sha: string | undefined;
+      const getRes = await githubGet(filePath);
+      if (getRes.ok) {
+        const existing = await getRes.json() as { sha: string };
+        sha = existing.sha;
+      }
+
+      const body: Record<string, string> = {
+        message: `agent: update ${filePath}`,
+        content: Buffer.from(input.content, 'utf-8').toString('base64'),
+        branch: GITHUB_BRANCH,
+      };
+      if (sha) {
+        body.sha = sha;
+      }
+
+      const putRes = await githubPut(filePath, body);
+      if (!putRes.ok) {
+        const errText = await putRes.text();
+        return `Error: ファイルの書き込みに失敗しました (${filePath}): ${putRes.status} ${errText}`;
+      }
+      return `Written: ${filePath}`;
     }
+
     return `Unknown tool: ${name}`;
   } catch (e) {
     return `Error: ${String(e)}`;
   }
 }
 
+async function executeAgent(
+  instruction: string,
+  department: string,
+  system_prompt?: string
+): Promise<{ result: string; messages: Anthropic.MessageParam[] }> {
+  const messages: Anthropic.MessageParam[] = [
+    { role: 'user', content: instruction }
+  ];
+
+  let finalText = '';
+
+  while (true) {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 8096,
+      tools,
+      system: system_prompt ?? undefined,
+      messages,
+    });
+
+    messages.push({ role: 'assistant', content: response.content });
+
+    if (response.stop_reason === 'end_turn') {
+      finalText = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+        .map(b => b.text)
+        .join('\n');
+      break;
+    }
+
+    if (response.stop_reason === 'tool_use') {
+      const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
+        response.content
+          .filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
+          .map(async (block) => ({
+            type: 'tool_result' as const,
+            tool_use_id: block.id,
+            content: await executeTool(block.name, block.input as Record<string, string>, department),
+          }))
+      );
+
+      messages.push({ role: 'user', content: toolResults });
+      continue;
+    }
+
+    break;
+  }
+
+  return { result: finalText, messages };
+}
+
 app.post('/execute-agent', async (req, res) => {
   const { instruction, department, system_prompt } = req.body;
 
   try {
-    const messages: Anthropic.MessageParam[] = [
-      { role: 'user', content: instruction }
-    ];
-
-    let finalText = '';
-
-    while (true) {
-      const response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 8096,
-        tools,
-        system: system_prompt ?? undefined,
-        messages,
-      });
-
-      messages.push({ role: 'assistant', content: response.content });
-
-      if (response.stop_reason === 'end_turn') {
-        finalText = response.content
-          .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-          .map(b => b.text)
-          .join('\n');
-        break;
-      }
-
-      if (response.stop_reason === 'tool_use') {
-        const toolResults: Anthropic.ToolResultBlockParam[] = response.content
-          .filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
-          .map(block => ({
-            type: 'tool_result' as const,
-            tool_use_id: block.id,
-            content: executeTool(block.name, block.input as Record<string, string>, department),
-          }));
-
-        messages.push({ role: 'user', content: toolResults });
-        continue;
-      }
-
-      break;
-    }
-
-    res.json({ success: true, result: finalText, messages });
+    const { result, messages } = await executeAgent(instruction, department, system_prompt);
+    res.json({ success: true, result, messages });
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, error: String(error) });
   }
+});
+
+app.post('/execute-bulk', async (req, res) => {
+  const { instruction, departments, system_prompts } = req.body as {
+    instruction: string;
+    departments: string[];
+    system_prompts?: Record<string, string>;
+  };
+
+  if (!instruction || !departments || !Array.isArray(departments) || departments.length === 0) {
+    res.status(400).json({ success: false, error: 'instruction and departments are required' });
+    return;
+  }
+
+  const results = await Promise.all(
+    departments.map(async (dept) => {
+      try {
+        const systemPrompt = system_prompts?.[dept];
+        const { result } = await executeAgent(instruction, dept, systemPrompt);
+        return { department: dept, success: true, result };
+      } catch (error) {
+        return { department: dept, success: false, error: String(error) };
+      }
+    })
+  );
+
+  res.json({ success: true, results });
 });
 
 app.get('/health', (req, res) => {
