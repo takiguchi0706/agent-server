@@ -11,7 +11,7 @@ const client = new Anthropic({
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'takiguchi0706/company-context';
-const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'master';
 
 const tools: Anthropic.Tool[] = [
   {
