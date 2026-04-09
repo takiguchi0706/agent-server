@@ -219,6 +219,41 @@ app.post('/execute-bulk', async (req, res) => {
   res.json({ success: true, results });
 });
 
+// SSEストリーミング版: 部署ごとに完了次第 data イベントを送信
+app.post('/execute-bulk-stream', async (req, res) => {
+  const { instruction, departments, system_prompts } = req.body as {
+    instruction: string;
+    departments: string[];
+    system_prompts?: Record<string, string>;
+  };
+
+  if (!instruction || !departments || !Array.isArray(departments) || departments.length === 0) {
+    res.status(400).json({ success: false, error: 'instruction and departments are required' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // 部署を直列で実行し、完了次第ストリームに書き出す
+  for (const dept of departments) {
+    try {
+      const systemPrompt = system_prompts?.[dept];
+      const { result } = await executeAgent(instruction, dept, systemPrompt);
+      const payload = JSON.stringify({ department: dept, success: true, result });
+      res.write(`data: ${payload}\n\n`);
+    } catch (error) {
+      const payload = JSON.stringify({ department: dept, success: false, error: String(error) });
+      res.write(`data: ${payload}\n\n`);
+    }
+  }
+
+  res.write('event: done\ndata: {}\n\n');
+  res.end();
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
