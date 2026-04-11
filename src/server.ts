@@ -129,16 +129,23 @@ async function executeTool(name: string, input: Record<string, string>, departme
   }
 }
 
+const COST_PER_INPUT = 3 / 1_000_000;
+const COST_PER_OUTPUT = 15 / 1_000_000;
+
+type Usage = { input_tokens: number; output_tokens: number; cost_usd: number };
+
 async function executeAgent(
   instruction: string,
   department: string,
   system_prompt?: string
-): Promise<{ result: string; messages: Anthropic.MessageParam[] }> {
+): Promise<{ result: string; messages: Anthropic.MessageParam[]; usage: Usage }> {
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: instruction }
   ];
 
   let finalText = '';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   while (true) {
     const response = await client.messages.create({
@@ -148,6 +155,9 @@ async function executeAgent(
       system: system_prompt ?? undefined,
       messages,
     });
+
+    totalInputTokens += response.usage.input_tokens;
+    totalOutputTokens += response.usage.output_tokens;
 
     messages.push({ role: 'assistant', content: response.content });
 
@@ -177,15 +187,16 @@ async function executeAgent(
     break;
   }
 
-  return { result: finalText, messages };
+  const cost_usd = totalInputTokens * COST_PER_INPUT + totalOutputTokens * COST_PER_OUTPUT;
+  return { result: finalText, messages, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cost_usd } };
 }
 
 app.post('/execute-agent', async (req, res) => {
   const { instruction, department, system_prompt } = req.body;
 
   try {
-    const { result, messages } = await executeAgent(instruction, department, system_prompt);
-    res.json({ success: true, result, messages });
+    const { result, messages, usage } = await executeAgent(instruction, department, system_prompt);
+    res.json({ success: true, result, messages, usage });
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, error: String(error) });
@@ -208,15 +219,27 @@ app.post('/execute-bulk', async (req, res) => {
     departments.map(async (dept) => {
       try {
         const systemPrompt = system_prompts?.[dept];
-        const { result } = await executeAgent(instruction, dept, systemPrompt);
-        return { department: dept, success: true, result };
+        const { result, usage } = await executeAgent(instruction, dept, systemPrompt);
+        return { department: dept, success: true, result, usage };
       } catch (error) {
         return { department: dept, success: false, error: String(error) };
       }
     })
   );
 
-  res.json({ success: true, results });
+  const totalUsage = results.reduce(
+    (acc, r) => {
+      if (r.success && 'usage' in r && r.usage) {
+        acc.input_tokens += r.usage.input_tokens;
+        acc.output_tokens += r.usage.output_tokens;
+        acc.cost_usd += r.usage.cost_usd;
+      }
+      return acc;
+    },
+    { input_tokens: 0, output_tokens: 0, cost_usd: 0 }
+  );
+
+  res.json({ success: true, results, usage: totalUsage });
 });
 
 // SSEストリーミング版: 部署ごとに完了次第 data イベントを送信
@@ -241,8 +264,8 @@ app.post('/execute-bulk-stream', async (req, res) => {
   for (const dept of departments) {
     try {
       const systemPrompt = system_prompts?.[dept];
-      const { result } = await executeAgent(instruction, dept, systemPrompt);
-      const payload = JSON.stringify({ department: dept, success: true, result });
+      const { result, usage } = await executeAgent(instruction, dept, systemPrompt);
+      const payload = JSON.stringify({ department: dept, success: true, result, usage });
       res.write(`data: ${payload}\n\n`);
     } catch (error) {
       const payload = JSON.stringify({ department: dept, success: false, error: String(error) });
