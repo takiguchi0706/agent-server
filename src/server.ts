@@ -203,6 +203,86 @@ app.post('/execute-agent', async (req, res) => {
   }
 });
 
+async function executeAgentStream(
+  instruction: string,
+  department: string,
+  system_prompt: string | undefined,
+  res: express.Response
+): Promise<void> {
+  const messages: Anthropic.MessageParam[] = [
+    { role: 'user', content: instruction }
+  ];
+
+  let fullContent = '';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
+  try {
+    while (true) {
+      const stream = client.messages.stream({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8096,
+        tools,
+        system: system_prompt ?? undefined,
+        messages,
+      });
+
+      for await (const event of stream) {
+        if (event.type === 'message_start') {
+          totalInputTokens += event.message.usage.input_tokens;
+        } else if (event.type === 'message_delta') {
+          totalOutputTokens += event.usage.output_tokens;
+        } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          fullContent += event.delta.text;
+          res.write(`data: ${JSON.stringify({ type: 'content_delta', text: event.delta.text })}\n\n`);
+        }
+      }
+
+      const finalMessage = await stream.finalMessage();
+      messages.push({ role: 'assistant', content: finalMessage.content });
+
+      if (finalMessage.stop_reason === 'end_turn') break;
+
+      if (finalMessage.stop_reason === 'tool_use') {
+        const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
+          finalMessage.content
+            .filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
+            .map(async (block) => ({
+              type: 'tool_result' as const,
+              tool_use_id: block.id,
+              content: await executeTool(block.name, block.input as Record<string, string>, department),
+            }))
+        );
+        messages.push({ role: 'user', content: toolResults });
+        continue;
+      }
+
+      break;
+    }
+
+    const cost_usd = totalInputTokens * COST_PER_INPUT + totalOutputTokens * COST_PER_OUTPUT;
+    res.write(`event: done\ndata: ${JSON.stringify({
+      usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens, cost_usd },
+      content: fullContent,
+    })}\n\n`);
+    res.end();
+  } catch (error) {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: String(error) })}\n\n`);
+    res.end();
+  }
+}
+
+app.post('/execute-agent-stream', async (req, res) => {
+  const { instruction, department, system_prompt } = req.body;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  await executeAgentStream(instruction, department, system_prompt, res);
+});
+
 app.post('/execute-bulk', async (req, res) => {
   const { instruction, departments, system_prompts } = req.body as {
     instruction: string;
